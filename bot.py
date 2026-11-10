@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import subprocess
@@ -80,18 +81,85 @@ def fetch_all_stories():
         pass
     return []
 
-def get_story_by_id_or_slug(identifier):
+def get_full_story_details(identifier):
+    """Story aur uske episodes ka pura detail (title, image, ep number) nikalna"""
+    story_obj = None
     stories = fetch_all_stories()
     for s in stories:
         if s.get("id") == identifier or s.get("slug") == identifier:
-            return s
-    try:
-        r = session.get(f"https://www.namanstorybook.in/api/series/{identifier}", timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
+            story_obj = s
+            break
+
+    # Detailed series API call taaki har episode ka title aur image mil sake
+    slug_or_id = story_obj.get("slug") if story_obj and story_obj.get("slug") else identifier
+    for target in [identifier, slug_or_id]:
+        try:
+            r = session.get(f"https://www.namanstorybook.in/api/series/{target}", timeout=10)
+            if r.status_code == 200:
+                detail = r.json()
+                if isinstance(detail, dict) and detail.get("episodes"):
+                    return detail
+        except Exception:
+            pass
+
+    return story_obj
+
+def extract_episode_meta(ep, idx, fallback_cover=None):
+    """Website ke episode object se exact Title, Episode Number aur uski apni Photo nikalna"""
+    if not isinstance(ep, dict):
+        return str(ep), f"Ep {idx}", f"Episode {idx}", fallback_cover
+
+    ep_id = ep.get("id", "")
+    
+    # Website par jo asli title hai (e.g. "1002-1003. DR DHRUV")
+    raw_title = ep.get("title") or ep.get("name") or ""
+    
+    # Website par jo asli episode number hai (e.g. "1002-1003" ya "E1002-1003")
+    raw_ep_num = (
+        ep.get("episodeNumber") 
+        or ep.get("episode_number") 
+        or ep.get("number") 
+        or ep.get("epNumber")
+        or ""
+    )
+
+    # Agar episode number title ke andar hi likha hai (jaise "1002-1003. DR DHRUV")
+    if not raw_ep_num and raw_title:
+        m = re.match(r'^([E0-9]+(?:\s*-\s*[0-9]+)?)', raw_title.strip(), re.I)
+        if m:
+            raw_ep_num = m.group(1)
+
+    # Button ke liye short label
+    if raw_ep_num:
+        clean_num = str(raw_ep_num).lstrip("Ee")
+        btn_label = f"E{clean_num}"
+    elif raw_title:
+        btn_label = raw_title[:18]
+    else:
+        btn_label = f"Ep {idx}"
+
+    # Full display title (Audio aur Photo caption ke liye)
+    if raw_title:
+        full_title = raw_title
+        if raw_ep_num and str(raw_ep_num) not in raw_title:
+            full_title = f"{raw_ep_num}. {raw_title}"
+    elif raw_ep_num:
+        full_title = f"Episode {raw_ep_num}"
+    else:
+        full_title = f"Episode {idx}"
+
+    # Episode ki apni specific photo dhoondhna (Story cover se pehle)
+    ep_image = (
+        ep.get("coverImage")
+        or ep.get("thumbnail")
+        or ep.get("image")
+        or ep.get("imageUrl")
+        or ep.get("poster")
+        or ep.get("thumb")
+        or fallback_cover
+    )
+
+    return ep_id, btn_label, full_title, ep_image
 
 def get_audio_url(episode_id):
     api_url = f"https://www.namanstorybook.in/api/episodes/{episode_id}/audio-url"
@@ -138,19 +206,23 @@ def get_audio_duration_seconds(file_path):
     except Exception:
         return 0
 
-async def process_and_send_episode(chat_id, ep_id, ep_num, story_title, cover_url=None):
-    status = await app.send_message(chat_id, f"⏳ Episode {ep_num} fetch ho raha hai...")
+async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cover=None):
+    ep_id, btn_label, full_ep_title, ep_image_url = extract_episode_meta(ep_obj, idx, story_cover)
+
+    status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...")
     audio_url = get_audio_url(ep_id)
     if not audio_url:
-        await safe_edit(status, f"❌ Episode {ep_num} ka audio link nahi mila.")
+        await safe_edit(status, f"❌ **{full_ep_title}** ka audio link nahi mila.")
         return
 
+    # Safe filename banana
+    safe_name = re.sub(r'[\\/*?:"<>|]', "", full_ep_title).strip().replace(" ", "_")
     raw_file = f"temp_{ep_id}.mp3"
-    m4a_file = f"Episode_{ep_num}.m4a"
+    m4a_file = f"{safe_name}.m4a"
     thumb_file = f"thumb_{ep_id}.jpg"
 
     try:
-        await safe_edit(status, f"⬇️ Downloading Ep {ep_num}...")
+        await safe_edit(status, f"⬇️ Downloading **{full_ep_title}**...")
         download_file(audio_url, raw_file)
 
         await safe_edit(status, f"⚡ M4A 64k compression...")
@@ -161,61 +233,76 @@ async def process_and_send_episode(chat_id, ep_id, ep_num, story_title, cover_ur
         duration_text = f"{mins:02d}:{secs:02d}"
         size_mb = os.path.getsize(final_file) / (1024 * 1024)
 
-        if cover_url:
+        # Episode ki apni photo download karke pehle bhejna
+        if ep_image_url:
             try:
-                download_file(cover_url, thumb_file)
-                # Episode se pehle uski image bhejna
+                download_file(ep_image_url, thumb_file)
                 await app.send_photo(
                     chat_id=chat_id,
                     photo=thumb_file,
-                    caption=f"🖼️ **{story_title} - Episode {ep_num}**"
+                    caption=(
+                        f"🎬 **{full_ep_title}**\n"
+                        f"📖 **Series:** {story_title}\n"
+                        f"🏷️ **Episode:** `{btn_label}`"
+                    )
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print("Ep image error:", e)
 
-        await safe_edit(status, f"⬆️ Uploading Ep {ep_num}...")
+        await safe_edit(status, f"⬆️ Uploading **{full_ep_title}**...")
         await app.send_audio(
             chat_id=chat_id,
             audio=final_file,
-            title=f"Episode {ep_num}",
+            title=full_ep_title,
             performer=story_title,
             duration=duration_sec,
             thumb=thumb_file if os.path.exists(thumb_file) else None,
-            caption=f"🎵 **{story_title} - Ep {ep_num}**\n⏱ **Duration:** `{duration_text}`\n📦 **Size:** `{size_mb:.2f} MB`"
+            caption=(
+                f"🎵 **{full_ep_title}**\n"
+                f"📖 **Story:** {story_title}\n"
+                f"⏱ **Duration:** `{duration_text}`\n"
+                f"📦 **Size:** `{size_mb:.2f} MB`"
+            )
         )
         await status.delete()
 
     except Exception as e:
-        await safe_edit(status, f"⚠️ Error Ep {ep_num}: {e}")
+        await safe_edit(status, f"⚠️ Error ({full_ep_title}): {e}")
     finally:
         for f in [raw_file, m4a_file, thumb_file]:
             if os.path.exists(f):
                 os.remove(f)
 
 async def background_auto_tracker():
-    """Bina kisi extra library ke har 10 min me new episode check karega"""
     while True:
         await asyncio.sleep(600)
         try:
             tracker = load_tracker()
             for s_id, data in tracker.items():
                 chat_id = data.get("chat_id")
-                known_count = data.get("last_count", 0)
-                story = get_story_by_id_or_slug(s_id)
+                known_ids = set(data.get("known_ep_ids", []))
+                story = get_full_story_details(s_id)
                 if not story:
                     continue
 
                 episodes = story.get("episodes", [])
-                total_online = len(episodes)
+                new_found = False
 
-                if total_online > known_count:
-                    new_eps = episodes[known_count:]
-                    for idx, ep in enumerate(new_eps, start=known_count + 1):
-                        ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
-                        await app.send_message(chat_id, f"🔔 **New Episode Alert!**\n`{story.get('title')}` ka Episode {idx} aa gaya hai!")
-                        await process_and_send_episode(chat_id, ep_id, idx, story.get("title"), story.get("coverImage"))
+                for idx, ep in enumerate(episodes, start=1):
+                    ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
+                    if ep_id not in known_ids:
+                        _, _, full_title, _ = extract_episode_meta(ep, idx, story.get("coverImage"))
+                        await app.send_message(
+                            chat_id,
+                            f"🔔 **New Episode Released!**\n📖 **{story.get('title')}**\n🎬 `{full_title}`"
+                        )
+                        await process_and_send_episode(chat_id, ep, idx, story.get("title"), story.get("coverImage"))
+                        known_ids.add(ep_id)
+                        new_found = True
 
-                    data["last_count"] = total_online
+                if new_found:
+                    data["known_ep_ids"] = list(known_ids)
+                    data["last_count"] = len(episodes)
                     save_tracker(tracker)
         except Exception as e:
             print("Tracker error:", e)
@@ -247,19 +334,21 @@ async def autoset_cmd(client, message):
         return
 
     query = args[1].strip()
-    story = get_story_by_id_or_slug(query)
+    story = get_full_story_details(query)
     if not story:
         await message.reply_text("❌ Story nahi mili. Sahi slug ya ID daalein.")
         return
 
     s_id = story.get("id") or query
     episodes = story.get("episodes", [])
+    ep_ids = [ep.get("id") if isinstance(ep, dict) else str(ep) for ep in episodes]
     
     tracker = load_tracker()
     tracker[s_id] = {
         "title": story.get("title"),
         "chat_id": message.chat.id,
-        "last_count": len(episodes)
+        "last_count": len(episodes),
+        "known_ep_ids": ep_ids
     }
     save_tracker(tracker)
 
@@ -267,7 +356,7 @@ async def autoset_cmd(client, message):
         f"✅ **Auto-Set Activated!**\n\n"
         f"📖 **Story:** {story.get('title')}\n"
         f"🔢 **Current Episodes:** {len(episodes)}\n\n"
-        f"Jab bhi naya episode aayega, bot automatically yahan bhej dega."
+        f"Jab bhi naya episode aayega, bot uski original photo aur title ke sath yahan bhej dega."
     )
 
 @app.on_message(filters.command("tracker"))
@@ -278,7 +367,7 @@ async def tracker_cmd(client, message):
         return
     text = "📋 **Active Auto-Trackers:**\n\n"
     for s_id, d in tracker.items():
-        text += f"• **{d.get('title')}** (Last: {d.get('last_count')} Eps)\n"
+        text += f"• **{d.get('title')}** (Tracked: {d.get('last_count')} Eps)\n"
     await message.reply_text(text)
 
 @app.on_message(filters.text & ~filters.command(["start", "autoset", "tracker"]))
@@ -297,23 +386,33 @@ async def handle_search_or_range(client, message):
         story_title = state["title"]
         cover_image = state["cover"]
 
-        ep_indices = []
-        if "-" in text:
-            try:
-                start_ep, end_ep = map(int, text.split("-"))
-                ep_indices = list(range(start_ep, min(end_ep + 1, len(episodes) + 1)))
-            except Exception:
-                pass
+        selected_eps = []
+        # 1. Check agar user ne serial range di hai (jaise 1-5)
+        if "-" in text and all(p.strip().isdigit() for p in text.split("-", 1)):
+            s_no, e_no = map(int, text.split("-", 1))
+            if 1 <= s_no <= len(episodes) and e_no <= len(episodes):
+                for idx in range(s_no, e_no + 1):
+                    selected_eps.append((idx, episodes[idx - 1]))
+            else:
+                # Check agar website ka episode নাম্বার hai (jaise 1002-1003)
+                for idx, ep in enumerate(episodes, 1):
+                    _, btn_l, full_t, _ = extract_episode_meta(ep, idx)
+                    if text.lower() in full_t.lower() or text.lower() in btn_l.lower():
+                        selected_eps.append((idx, ep))
+
         elif text.isdigit():
             val = int(text)
             if 1 <= val <= len(episodes):
-                ep_indices = [val]
+                selected_eps.append((val, episodes[val - 1]))
+            else:
+                for idx, ep in enumerate(episodes, 1):
+                    _, btn_l, full_t, _ = extract_episode_meta(ep, idx)
+                    if text in full_t or text in btn_l:
+                        selected_eps.append((idx, ep))
 
-        if ep_indices:
-            for num in ep_indices:
-                ep_data = episodes[num - 1]
-                ep_id = ep_data.get("id") if isinstance(ep_data, dict) else str(ep_data)
-                await process_and_send_episode(message.chat.id, ep_id, num, story_title, cover_image)
+        if selected_eps:
+            for idx, ep_data in selected_eps:
+                await process_and_send_episode(message.chat.id, ep_data, idx, story_title, cover_image)
             return
 
     status = await message.reply_text("🔍 Search kiya ja raha hai...")
@@ -342,22 +441,15 @@ async def handle_story_click(client, callback_query):
         pass
 
     story_id = callback_query.data.split("_")[1]
-    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
+    story = get_full_story_details(story_id) or STORY_STORE.get(story_id)
     if not story:
         return
 
+    STORY_STORE[story_id] = story
     title = story.get("title", "Story")
     category = story.get("category", "Hindi")
     cover_image = story.get("coverImage")
     episodes = story.get("episodes", [])
-
-    if not episodes:
-        try:
-            r = session.get(f"https://www.namanstorybook.in/api/series/{story_id}", timeout=10)
-            if r.status_code == 200:
-                episodes = r.json().get("episodes", [])
-        except Exception:
-            pass
 
     USER_STATE[callback_query.from_user.id] = {
         "title": title,
@@ -368,9 +460,9 @@ async def handle_story_click(client, callback_query):
     caption = (
         f"📖 **{title}**\n\n"
         f"🗣️ **Language:** {category}\n"
-        f"📊 **Total Episodes:** {len(episodes)}\n\n"
+        f"📊 **Total Available Episodes:** {len(episodes)}\n\n"
         f"📌 **Send episode number or range to start download.**\n"
-        f"• *Examples: 5 or 1-10*"
+        f"• *Examples: 1 or 1-5 or 1002-1003*"
     )
 
     buttons = InlineKeyboardMarkup([
@@ -391,22 +483,24 @@ async def handle_story_click(client, callback_query):
 @app.on_callback_query(filters.regex(r"^auto_"))
 async def handle_auto_button(client, callback_query):
     story_id = callback_query.data.split("_")[1]
-    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
+    story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     if not story:
         await callback_query.answer("Story load nahi hui!", show_alert=True)
         return
 
     episodes = story.get("episodes", [])
+    ep_ids = [ep.get("id") if isinstance(ep, dict) else str(ep) for ep in episodes]
     tracker = load_tracker()
     tracker[story_id] = {
         "title": story.get("title"),
         "chat_id": callback_query.message.chat.id,
-        "last_count": len(episodes)
+        "last_count": len(episodes),
+        "known_ep_ids": ep_ids
     }
     save_tracker(tracker)
     await callback_query.answer("✅ Auto-Set Activated!", show_alert=True)
     await callback_query.message.reply_text(
-        f"🔔 **{story.get('title')}** ko Auto-Download par set kar diya gaya hai (Current: {len(episodes)} Eps).\nJab bhi naya episode aayega, bot khud bhej dega!"
+        f"🔔 **{story.get('title')}** ko Auto-Download par set kar diya gaya hai (Current: {len(episodes)} Eps).\nJab bhi naya episode aayega, bot uski photo aur title ke sath bhej dega!"
     )
 
 @app.on_callback_query(filters.regex(r"^all_"))
@@ -416,13 +510,12 @@ async def handle_all_episodes(client, callback_query):
     except Exception:
         pass
     story_id = callback_query.data.split("_")[1]
-    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
+    story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     if not story:
         return
     episodes = story.get("episodes", [])
     for idx, ep in enumerate(episodes, 1):
-        ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
-        await process_and_send_episode(callback_query.message.chat.id, ep_id, idx, story.get("title"), story.get("coverImage"))
+        await process_and_send_episode(callback_query.message.chat.id, ep, idx, story.get("title"), story.get("coverImage"))
 
 @app.on_callback_query(filters.regex(r"^page_"))
 async def handle_select_episodes_grid(client, callback_query):
@@ -433,24 +526,20 @@ async def handle_select_episodes_grid(client, callback_query):
     parts = callback_query.data.split("_")
     page = int(parts[1])
     story_id = parts[2]
-    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
+    story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     episodes = story.get("episodes", [])
 
-    per_page = 20
+    per_page = 10
     total_pages = (len(episodes) + per_page - 1) // per_page
     start = (page - 1) * per_page
     end = start + per_page
     current_eps = episodes[start:end]
 
-    buttons, row = [], []
+    buttons = []
     for idx, ep in enumerate(current_eps, start=start + 1):
-        ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
-        row.append(InlineKeyboardButton(f"Ep {idx}", callback_data=f"one_{ep_id}_{idx}_{story_id}"))
-        if len(row) == 4:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+        ep_id, btn_label, full_title, _ = extract_episode_meta(ep, idx)
+        # Button par exact Episode Number + Title dikhana (jaise: "1002-1003. DR DHRUV")
+        buttons.append([InlineKeyboardButton(f"▶️ {full_title}", callback_data=f"one_{idx}_{story_id}")])
 
     nav = []
     if page > 1:
@@ -460,7 +549,10 @@ async def handle_select_episodes_grid(client, callback_query):
     if nav:
         buttons.append(nav)
 
-    await callback_query.message.reply_text(f"🔢 Episodes Page {page}/{total_pages}:", reply_markup=InlineKeyboardMarkup(buttons))
+    await callback_query.message.reply_text(
+        f"🎬 **{story.get('title')} - Episodes List (Page {page}/{total_pages}):**\n👇 Jis episode ko download karna hai us par click karein:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 @app.on_callback_query(filters.regex(r"^one_"))
 async def handle_single_episode(client, callback_query):
@@ -469,10 +561,14 @@ async def handle_single_episode(client, callback_query):
     except Exception:
         pass
     parts = callback_query.data.split("_")
-    ep_id, ep_num, story_id = parts[1], parts[2], parts[3]
-    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
-    await process_and_send_episode(callback_query.message.chat.id, ep_id, int(ep_num), story.get("title"), story.get("coverImage"))
+    idx = int(parts[1])
+    story_id = parts[2]
+    story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
+    episodes = story.get("episodes", [])
+    if 1 <= idx <= len(episodes):
+        ep_obj = episodes[idx - 1]
+        await process_and_send_episode(callback_query.message.chat.id, ep_obj, idx, story.get("title"), story.get("coverImage"))
 
 login_to_site()
-print(">>> Naman Story Bot v2 is 100% READY!")
+print(">>> Naman Story Bot v3 (Episode Photos + Exact Titles) is READY!")
 app.run()
