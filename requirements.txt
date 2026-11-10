@@ -1,0 +1,5 @@
+pyrogram
+tgcrypto
+requests
+mutagen
+python-dotenv
