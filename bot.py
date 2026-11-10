@@ -4,19 +4,18 @@ import asyncio
 import subprocess
 import requests
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import MessageNotModified
 from mutagen.mp4 import MP4
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-EMAIL = os.getenv("SITE_EMAIL")
-PASSWORD = os.getenv("SITE_PASSWORD")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9082003026:AAGJ4cU0bQysTVqYrKn2kTkBov3Z3iQFiMM")
+API_ID = int(os.getenv("API_ID", 32156800))
+API_HASH = os.getenv("API_HASH", "73fbf3673dd59fd129a9937ca11c00d2")
+EMAIL = os.getenv("SITE_EMAIL", "Anilk242843@gmail.com")
+PASSWORD = os.getenv("SITE_PASSWORD", "ROHIT12345")
 
 session = requests.Session()
 session.headers.update({
@@ -30,6 +29,7 @@ app = Client("naman_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 STORY_STORE = {}
 USER_STATE = {}
 TRACKER_FILE = "autoset_data.json"
+TRACKER_RUNNING = False
 
 def load_tracker():
     if os.path.exists(TRACKER_FILE):
@@ -164,6 +164,12 @@ async def process_and_send_episode(chat_id, ep_id, ep_num, story_title, cover_ur
         if cover_url:
             try:
                 download_file(cover_url, thumb_file)
+                # Episode se pehle uski image bhejna
+                await app.send_photo(
+                    chat_id=chat_id,
+                    photo=thumb_file,
+                    caption=f"🖼️ **{story_title} - Episode {ep_num}**"
+                )
             except Exception:
                 pass
 
@@ -186,31 +192,41 @@ async def process_and_send_episode(chat_id, ep_id, ep_num, story_title, cover_ur
             if os.path.exists(f):
                 os.remove(f)
 
-# Auto Tracker Function
-async def check_new_episodes_job():
-    tracker = load_tracker()
-    for s_id, data in tracker.items():
-        chat_id = data.get("chat_id")
-        known_count = data.get("last_count", 0)
-        story = get_story_by_id_or_slug(s_id)
-        if not story:
-            continue
+async def background_auto_tracker():
+    """Bina kisi extra library ke har 10 min me new episode check karega"""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            tracker = load_tracker()
+            for s_id, data in tracker.items():
+                chat_id = data.get("chat_id")
+                known_count = data.get("last_count", 0)
+                story = get_story_by_id_or_slug(s_id)
+                if not story:
+                    continue
 
-        episodes = story.get("episodes", [])
-        total_online = len(episodes)
+                episodes = story.get("episodes", [])
+                total_online = len(episodes)
 
-        if total_online > known_count:
-            new_eps = episodes[known_count:]
-            for idx, ep in enumerate(new_eps, start=known_count + 1):
-                ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
-                await app.send_message(chat_id, f"🔔 **New Episode Alert!**\n`{story.get('title')}` ka naya Episode {idx} aa gaya hai!")
-                await process_and_send_episode(chat_id, ep_id, idx, story.get("title"), story.get("coverImage"))
-            
-            data["last_count"] = total_online
-            save_tracker(tracker)
+                if total_online > known_count:
+                    new_eps = episodes[known_count:]
+                    for idx, ep in enumerate(new_eps, start=known_count + 1):
+                        ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
+                        await app.send_message(chat_id, f"🔔 **New Episode Alert!**\n`{story.get('title')}` ka Episode {idx} aa gaya hai!")
+                        await process_and_send_episode(chat_id, ep_id, idx, story.get("title"), story.get("coverImage"))
+
+                    data["last_count"] = total_online
+                    save_tracker(tracker)
+        except Exception as e:
+            print("Tracker error:", e)
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
+    global TRACKER_RUNNING
+    if not TRACKER_RUNNING:
+        TRACKER_RUNNING = True
+        asyncio.create_task(background_auto_tracker())
+
     await message.reply_text(
         "🎧 **Naman Story Book Bot**\n\n"
         "• Kisi bhi story ka naam bhejo (e.g. `demon`).\n"
@@ -220,6 +236,11 @@ async def start_cmd(client, message):
 
 @app.on_message(filters.command("autoset"))
 async def autoset_cmd(client, message):
+    global TRACKER_RUNNING
+    if not TRACKER_RUNNING:
+        TRACKER_RUNNING = True
+        asyncio.create_task(background_auto_tracker())
+
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.reply_text("Usage: `/autoset <story_name ya slug>`\nExample: `/autoset demon-premium`")
@@ -246,7 +267,7 @@ async def autoset_cmd(client, message):
         f"✅ **Auto-Set Activated!**\n\n"
         f"📖 **Story:** {story.get('title')}\n"
         f"🔢 **Current Episodes:** {len(episodes)}\n\n"
-        f"Jab bhi website par naya episode aayega, bot use automatically download aur compress karke yahan bhej dega."
+        f"Jab bhi naya episode aayega, bot automatically yahan bhej dega."
     )
 
 @app.on_message(filters.command("tracker"))
@@ -262,6 +283,11 @@ async def tracker_cmd(client, message):
 
 @app.on_message(filters.text & ~filters.command(["start", "autoset", "tracker"]))
 async def handle_search_or_range(client, message):
+    global TRACKER_RUNNING
+    if not TRACKER_RUNNING:
+        TRACKER_RUNNING = True
+        asyncio.create_task(background_auto_tracker())
+
     user_id = message.from_user.id
     text = message.text.strip()
 
@@ -284,7 +310,6 @@ async def handle_search_or_range(client, message):
                 ep_indices = [val]
 
         if ep_indices:
-            del USER_STATE[user_id]
             for num in ep_indices:
                 ep_data = episodes[num - 1]
                 ep_id = ep_data.get("id") if isinstance(ep_data, dict) else str(ep_data)
@@ -317,7 +342,7 @@ async def handle_story_click(client, callback_query):
         pass
 
     story_id = callback_query.data.split("_")[1]
-    story = STORY_STORE.get(story_id)
+    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
     if not story:
         return
 
@@ -352,6 +377,9 @@ async def handle_story_click(client, callback_query):
         [
             InlineKeyboardButton("All Episodes", callback_data=f"all_{story_id}"),
             InlineKeyboardButton("Select Episodes", callback_data=f"page_1_{story_id}")
+        ],
+        [
+            InlineKeyboardButton("🔔 Auto-Set New Episodes", callback_data=f"auto_{story_id}")
         ]
     ])
 
@@ -360,10 +388,31 @@ async def handle_story_click(client, callback_query):
     else:
         await callback_query.message.reply_text(text=caption, reply_markup=buttons)
 
+@app.on_callback_query(filters.regex(r"^auto_"))
+async def handle_auto_button(client, callback_query):
+    story_id = callback_query.data.split("_")[1]
+    story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
+    if not story:
+        await callback_query.answer("Story load nahi hui!", show_alert=True)
+        return
+
+    episodes = story.get("episodes", [])
+    tracker = load_tracker()
+    tracker[story_id] = {
+        "title": story.get("title"),
+        "chat_id": callback_query.message.chat.id,
+        "last_count": len(episodes)
+    }
+    save_tracker(tracker)
+    await callback_query.answer("✅ Auto-Set Activated!", show_alert=True)
+    await callback_query.message.reply_text(
+        f"🔔 **{story.get('title')}** ko Auto-Download par set kar diya gaya hai (Current: {len(episodes)} Eps).\nJab bhi naya episode aayega, bot khud bhej dega!"
+    )
+
 @app.on_callback_query(filters.regex(r"^all_"))
 async def handle_all_episodes(client, callback_query):
     try:
-        await callback_query.answer("Download shuru...")
+        await callback_query.answer("All Episodes Download shuru...")
     except Exception:
         pass
     story_id = callback_query.data.split("_")[1]
@@ -424,18 +473,6 @@ async def handle_single_episode(client, callback_query):
     story = STORY_STORE.get(story_id) or get_story_by_id_or_slug(story_id)
     await process_and_send_episode(callback_query.message.chat.id, ep_id, int(ep_num), story.get("title"), story.get("coverImage"))
 
-async def main():
-    login_to_site()
-    await app.start()
-    
-    # Python 3.12 compatible scheduler loop
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_new_episodes_job, "interval", minutes=10)
-    scheduler.start()
-    
-    print(">>> Naman Story Bot with Auto-Set & Range Downloader is READY!")
-    await idle()
-    await app.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+login_to_site()
+print(">>> Naman Story Bot v2 is 100% READY!")
+app.run()
