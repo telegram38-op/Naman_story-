@@ -18,10 +18,12 @@ API_HASH = os.getenv("API_HASH", "73fbf3673dd59fd129a9937ca11c00d2")
 EMAIL = os.getenv("SITE_EMAIL", "Anilk242843@gmail.com")
 PASSWORD = os.getenv("SITE_PASSWORD", "ROHIT12345")
 
+BASE_URL = "https://www.namanstorybook.in"
+
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.namanstorybook.in/",
+    "Referer": f"{BASE_URL}/",
     "Content-Type": "application/json"
 })
 
@@ -29,6 +31,7 @@ app = Client("naman_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 STORY_STORE = {}
 USER_STATE = {}
+CANCEL_FLAGS = {}  # Batch downloads rokne ke liye
 TRACKER_FILE = "autoset_data.json"
 TRACKER_RUNNING = False
 
@@ -54,11 +57,56 @@ async def safe_edit(message, text):
     except Exception:
         pass
 
-def login_to_site():
-    login_urls = [
-        "https://www.namanstorybook.in/api/auth/login",
-        "https://www.namanstorybook.in/api/login"
+def normalize_url(u):
+    """Relative image path ko full URL me badalna"""
+    if not u or not isinstance(u, str):
+        return None
+    u = u.strip()
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    if u.startswith("/"):
+        return f"{BASE_URL}{u}"
+    return None
+
+def find_image_in_dict(d, ignore_url=None):
+    """Dictionary ke andar kisi bhi naam se chhupi image URL ko dhoondhna"""
+    if not isinstance(d, dict):
+        return None
+
+    # 1. Priority keys check
+    priority_keys = [
+        "thumbnail", "thumbnailUrl", "thumb", "thumbUrl",
+        "episodeImage", "episode_image", "epImage",
+        "image", "imageUrl", "img", "imgUrl",
+        "coverImage", "cover_image", "cover", "coverUrl",
+        "banner", "bannerUrl", "poster", "posterUrl", "artwork", "photo"
     ]
+    for k in priority_keys:
+        val = d.get(k)
+        if isinstance(val, str) and val.strip():
+            full = normalize_url(val)
+            if full and full != ignore_url:
+                return full
+        elif isinstance(val, dict):
+            nested = val.get("url") or val.get("src") or val.get("path")
+            full = normalize_url(nested)
+            if full and full != ignore_url:
+                return full
+
+    # 2. Deep scan: kisi bhi key me agar .png/.jpg/.webp/.jpeg link ho
+    for k, val in d.items():
+        if k in ["audioUrl", "audio_url", "url", "id", "seriesId", "storyId"]:
+            continue
+        if isinstance(val, str):
+            low = val.lower()
+            if any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", "r2.dev", "cloudfront", "images", "uploads"]):
+                full = normalize_url(val)
+                if full and full != ignore_url:
+                    return full
+    return None
+
+def login_to_site():
+    login_urls = [f"{BASE_URL}/api/auth/login", f"{BASE_URL}/api/login"]
     payload = {"email": EMAIL, "password": PASSWORD}
     for url in login_urls:
         try:
@@ -71,9 +119,8 @@ def login_to_site():
     return False
 
 def fetch_all_stories():
-    url = "https://www.namanstorybook.in/api/stories"
     try:
-        res = session.get(url, timeout=12)
+        res = session.get(f"{BASE_URL}/api/stories", timeout=12)
         if res.status_code == 200:
             data = res.json()
             return data if isinstance(data, list) else data.get("stories", [])
@@ -82,7 +129,6 @@ def fetch_all_stories():
     return []
 
 def get_full_story_details(identifier):
-    """Story aur uske episodes ka pura detail (title, image, ep number) nikalna"""
     story_obj = None
     stories = fetch_all_stories()
     for s in stories:
@@ -90,46 +136,72 @@ def get_full_story_details(identifier):
             story_obj = s
             break
 
-    # Detailed series API call taaki har episode ka title aur image mil sake
-    slug_or_id = story_obj.get("slug") if story_obj and story_obj.get("slug") else identifier
-    for target in [identifier, slug_or_id]:
+    slug = story_obj.get("slug") if story_obj and story_obj.get("slug") else identifier
+    s_id = story_obj.get("id") if story_obj and story_obj.get("id") else identifier
+
+    # Different endpoints check karna taaki episodes ke pure fields milen
+    endpoints = [
+        f"{BASE_URL}/api/series/{s_id}",
+        f"{BASE_URL}/api/series/{slug}",
+        f"{BASE_URL}/api/stories/{s_id}",
+        f"{BASE_URL}/api/stories/{slug}"
+    ]
+    for ep_url in endpoints:
         try:
-            r = session.get(f"https://www.namanstorybook.in/api/series/{target}", timeout=10)
+            r = session.get(ep_url, timeout=10)
             if r.status_code == 200:
                 detail = r.json()
-                if isinstance(detail, dict) and detail.get("episodes"):
-                    return detail
+                if isinstance(detail, dict):
+                    inner = detail.get("series") or detail.get("story") or detail.get("data") or detail
+                    if isinstance(inner, dict) and inner.get("episodes"):
+                        return inner
         except Exception:
             pass
 
     return story_obj
 
+def fetch_single_episode_image(ep_id, story_cover=None):
+    """Agar list me episode photo na ho toh direct episode API se nikalna"""
+    urls = [
+        f"{BASE_URL}/api/episodes/{ep_id}",
+        f"{BASE_URL}/api/episode/{ep_id}"
+    ]
+    for u in urls:
+        try:
+            r = session.get(u, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                ep_data = data.get("episode") or data.get("data") or data
+                img = find_image_in_dict(ep_data, ignore_url=story_cover)
+                if img:
+                    return img
+        except Exception:
+            pass
+    return None
+
 def extract_episode_meta(ep, idx, fallback_cover=None):
-    """Website ke episode object se exact Title, Episode Number aur uski apni Photo nikalna"""
+    fallback_cover = normalize_url(fallback_cover)
     if not isinstance(ep, dict):
         return str(ep), f"Ep {idx}", f"Episode {idx}", fallback_cover
 
+    # Log me keys print karna taaki exact field dikhe
+    print(f"[EPISODE {idx} DATA]: {json.dumps(ep)[:300]}")
+
     ep_id = ep.get("id", "")
-    
-    # Website par jo asli title hai (e.g. "1002-1003. DR DHRUV")
     raw_title = ep.get("title") or ep.get("name") or ""
-    
-    # Website par jo asli episode number hai (e.g. "1002-1003" ya "E1002-1003")
     raw_ep_num = (
-        ep.get("episodeNumber") 
-        or ep.get("episode_number") 
-        or ep.get("number") 
+        ep.get("episodeNumber")
+        or ep.get("episode_number")
+        or ep.get("number")
         or ep.get("epNumber")
         or ""
     )
 
-    # Agar episode number title ke andar hi likha hai (jaise "1002-1003. DR DHRUV")
     if not raw_ep_num and raw_title:
         m = re.match(r'^([E0-9]+(?:\s*-\s*[0-9]+)?)', raw_title.strip(), re.I)
         if m:
             raw_ep_num = m.group(1)
 
-    # Button ke liye short label
     if raw_ep_num:
         clean_num = str(raw_ep_num).lstrip("Ee")
         btn_label = f"E{clean_num}"
@@ -138,7 +210,6 @@ def extract_episode_meta(ep, idx, fallback_cover=None):
     else:
         btn_label = f"Ep {idx}"
 
-    # Full display title (Audio aur Photo caption ke liye)
     if raw_title:
         full_title = raw_title
         if raw_ep_num and str(raw_ep_num) not in raw_title:
@@ -148,21 +219,21 @@ def extract_episode_meta(ep, idx, fallback_cover=None):
     else:
         full_title = f"Episode {idx}"
 
-    # Episode ki apni specific photo dhoondhna (Story cover se pehle)
-    ep_image = (
-        ep.get("coverImage")
-        or ep.get("thumbnail")
-        or ep.get("image")
-        or ep.get("imageUrl")
-        or ep.get("poster")
-        or ep.get("thumb")
-        or fallback_cover
-    )
+    # 1. Episode dict ke andar image dhoondhna (story cover ko ignore karke)
+    ep_image = find_image_in_dict(ep, ignore_url=fallback_cover)
+
+    # 2. Agar nahi mili, toh single episode endpoint ya audio-url response me check karna
+    if not ep_image and ep_id:
+        ep_image = fetch_single_episode_image(ep_id, story_cover=fallback_cover)
+
+    # 3. Last fallback
+    if not ep_image:
+        ep_image = find_image_in_dict(ep) or fallback_cover
 
     return ep_id, btn_label, full_title, ep_image
 
-def get_audio_url(episode_id):
-    api_url = f"https://www.namanstorybook.in/api/episodes/{episode_id}/audio-url"
+def get_audio_url_and_meta(episode_id):
+    api_url = f"{BASE_URL}/api/episodes/{episode_id}/audio-url"
     res = session.get(api_url, timeout=15)
     if res.status_code == 401:
         if login_to_site():
@@ -172,11 +243,13 @@ def get_audio_url(episode_id):
         try:
             d = res.json()
             if isinstance(d, dict):
-                return d.get("audioUrl") or d.get("url") or d.get("audio_url")
-            return res.text.strip('"')
+                audio_u = d.get("audioUrl") or d.get("url") or d.get("audio_url")
+                extra_img = find_image_in_dict(d)
+                return audio_u, extra_img
+            return res.text.strip('"'), None
         except Exception:
-            return res.text.strip('"')
-    return None
+            return res.text.strip('"'), None
+    return None, None
 
 def download_file(url, out_path):
     with session.get(url, stream=True, timeout=90) as r:
@@ -209,13 +282,16 @@ def get_audio_duration_seconds(file_path):
 async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cover=None):
     ep_id, btn_label, full_ep_title, ep_image_url = extract_episode_meta(ep_obj, idx, story_cover)
 
-    status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...")
-    audio_url = get_audio_url(ep_id)
+    status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...\n*(Rokne ke liye /cancel bhejein)*")
+    audio_url, extra_img = get_audio_url_and_meta(ep_id)
+
+    if extra_img and (not ep_image_url or ep_image_url == normalize_url(story_cover)):
+        ep_image_url = extra_img
+
     if not audio_url:
         await safe_edit(status, f"❌ **{full_ep_title}** ka audio link nahi mila.")
         return
 
-    # Safe filename banana
     safe_name = re.sub(r'[\\/*?:"<>|]', "", full_ep_title).strip().replace(" ", "_")
     raw_file = f"temp_{ep_id}.mp3"
     m4a_file = f"{safe_name}.m4a"
@@ -233,7 +309,6 @@ async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cove
         duration_text = f"{mins:02d}:{secs:02d}"
         size_mb = os.path.getsize(final_file) / (1024 * 1024)
 
-        # Episode ki apni photo download karke pehle bhejna
         if ep_image_url:
             try:
                 download_file(ep_image_url, thumb_file)
@@ -278,7 +353,7 @@ async def background_auto_tracker():
         await asyncio.sleep(600)
         try:
             tracker = load_tracker()
-            for s_id, data in tracker.items():
+            for s_id, data in list(tracker.items()):
                 chat_id = data.get("chat_id")
                 known_ids = set(data.get("known_ep_ids", []))
                 story = get_full_story_details(s_id)
@@ -316,10 +391,46 @@ async def start_cmd(client, message):
 
     await message.reply_text(
         "🎧 **Naman Story Book Bot**\n\n"
-        "• Kisi bhi story ka naam bhejo (e.g. `demon`).\n"
-        "• Auto update set karne ke liye: `/autoset <story_slug>`\n"
-        "• Active auto-fetch dekhne ke liye: `/tracker`"
+        "• Story search karne ke liye naam bhejein (e.g. `demon`).\n"
+        "• Chal rahe download ko rokne ke liye: `/cancel` ya `/stop`\n"
+        "• Auto-Set list aur band karne ke liye: `/tracker`\n"
+        "• Saare Auto-Set ek sath hatane ke liye: `/stopauto`"
     )
+
+@app.on_message(filters.command(["cancel", "stop"]))
+async def cancel_cmd(client, message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    CANCEL_FLAGS[chat_id] = True
+    USER_STATE.pop(user_id, None)
+    await message.reply_text("🛑 **Stopped!** Chal raha batch download aur active selection cancel kar diya gaya hai.")
+
+@app.on_message(filters.command(["stopauto", "untrack"]))
+async def stop_auto_cmd(client, message):
+    args = message.text.split(maxsplit=1)
+    tracker = load_tracker()
+    if not tracker:
+        await message.reply_text("ℹ️ Koi bhi story Auto-Set par nahi hai.")
+        return
+
+    if len(args) == 1:
+        save_tracker({})
+        await message.reply_text("🛑 **Saare Auto-Set trackers band kar diye gaye hain!**")
+        return
+
+    query = args[1].strip().lower()
+    removed = []
+    for s_id in list(tracker.keys()):
+        title = tracker[s_id].get("title", "").lower()
+        if query in s_id.lower() or query in title:
+            removed.append(tracker[s_id].get("title", s_id))
+            del tracker[s_id]
+
+    save_tracker(tracker)
+    if removed:
+        await message.reply_text(f"🛑 Auto-Set hataya gaya: **{', '.join(removed)}**")
+    else:
+        await message.reply_text("❌ Is naam ki koi story Auto-Set me nahi mili. `/tracker` dekhein.")
 
 @app.on_message(filters.command("autoset"))
 async def autoset_cmd(client, message):
@@ -330,7 +441,7 @@ async def autoset_cmd(client, message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.reply_text("Usage: `/autoset <story_name ya slug>`\nExample: `/autoset demon-premium`")
+        await message.reply_text("Usage: `/autoset <story_name ya slug>`\nBand karne ke liye: `/tracker` ya `/stopauto`")
         return
 
     query = args[1].strip()
@@ -352,25 +463,52 @@ async def autoset_cmd(client, message):
     }
     save_tracker(tracker)
 
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Stop Auto-Set", callback_data=f"unauto_{s_id}")]])
     await message.reply_text(
         f"✅ **Auto-Set Activated!**\n\n"
         f"📖 **Story:** {story.get('title')}\n"
-        f"🔢 **Current Episodes:** {len(episodes)}\n\n"
-        f"Jab bhi naya episode aayega, bot uski original photo aur title ke sath yahan bhej dega."
+        f"🔢 **Current Episodes:** {len(episodes)}",
+        reply_markup=btn
     )
 
 @app.on_message(filters.command("tracker"))
 async def tracker_cmd(client, message):
     tracker = load_tracker()
     if not tracker:
-        await message.reply_text("Koi bhi story auto-set par nahi hai.")
+        await message.reply_text("ℹ️ Koi bhi story Auto-Set par nahi hai.")
         return
-    text = "📋 **Active Auto-Trackers:**\n\n"
-    for s_id, d in tracker.items():
-        text += f"• **{d.get('title')}** (Tracked: {d.get('last_count')} Eps)\n"
-    await message.reply_text(text)
 
-@app.on_message(filters.text & ~filters.command(["start", "autoset", "tracker"]))
+    text = "📋 **Active Auto-Trackers:**\n*(Band karne ke liye neeche button dabayein)*\n\n"
+    buttons = []
+    for s_id, d in tracker.items():
+        title = d.get("title", s_id)
+        text += f"• **{title}** ({d.get('last_count')} Eps)\n"
+        buttons.append([InlineKeyboardButton(f"❌ Stop: {title}", callback_data=f"unauto_{s_id}")])
+
+    buttons.append([InlineKeyboardButton("🗑️ Stop All Auto-Sets", callback_data="unauto_ALL")])
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^unauto_"))
+async def handle_unauto_callback(client, callback_query):
+    target = callback_query.data.split("_", 1)[1]
+    tracker = load_tracker()
+
+    if target == "ALL":
+        save_tracker({})
+        await callback_query.answer("Saare Auto-Set band kar diye gaye!", show_alert=True)
+        await safe_edit(callback_query.message, "🛑 **Saare Auto-Set trackers band kar diye gaye hain.**")
+        return
+
+    if target in tracker:
+        title = tracker[target].get("title", target)
+        del tracker[target]
+        save_tracker(tracker)
+        await callback_query.answer(f"Stopped: {title}", show_alert=True)
+        await safe_edit(callback_query.message, f"🛑 **{title}** ka Auto-Set band kar diya gaya hai.")
+    else:
+        await callback_query.answer("Yeh pehle hi band ho chuka hai.", show_alert=True)
+
+@app.on_message(filters.text & ~filters.command(["start", "autoset", "tracker", "cancel", "stop", "stopauto", "untrack"]))
 async def handle_search_or_range(client, message):
     global TRACKER_RUNNING
     if not TRACKER_RUNNING:
@@ -378,6 +516,7 @@ async def handle_search_or_range(client, message):
         asyncio.create_task(background_auto_tracker())
 
     user_id = message.from_user.id
+    chat_id = message.chat.id
     text = message.text.strip()
 
     if user_id in USER_STATE:
@@ -387,14 +526,12 @@ async def handle_search_or_range(client, message):
         cover_image = state["cover"]
 
         selected_eps = []
-        # 1. Check agar user ne serial range di hai (jaise 1-5)
         if "-" in text and all(p.strip().isdigit() for p in text.split("-", 1)):
             s_no, e_no = map(int, text.split("-", 1))
             if 1 <= s_no <= len(episodes) and e_no <= len(episodes):
                 for idx in range(s_no, e_no + 1):
                     selected_eps.append((idx, episodes[idx - 1]))
             else:
-                # Check agar website ka episode নাম্বার hai (jaise 1002-1003)
                 for idx, ep in enumerate(episodes, 1):
                     _, btn_l, full_t, _ = extract_episode_meta(ep, idx)
                     if text.lower() in full_t.lower() or text.lower() in btn_l.lower():
@@ -411,8 +548,12 @@ async def handle_search_or_range(client, message):
                         selected_eps.append((idx, ep))
 
         if selected_eps:
+            CANCEL_FLAGS[chat_id] = False
             for idx, ep_data in selected_eps:
-                await process_and_send_episode(message.chat.id, ep_data, idx, story_title, cover_image)
+                if CANCEL_FLAGS.get(chat_id):
+                    await message.reply_text("🛑 **Download Cancelled!**")
+                    break
+                await process_and_send_episode(chat_id, ep_data, idx, story_title, cover_image)
             return
 
     status = await message.reply_text("🔍 Search kiya ja raha hai...")
@@ -457,12 +598,22 @@ async def handle_story_click(client, callback_query):
         "cover": cover_image
     }
 
+    tracker = load_tracker()
+    is_tracked = story_id in tracker
+
     caption = (
         f"📖 **{title}**\n\n"
         f"🗣️ **Language:** {category}\n"
         f"📊 **Total Available Episodes:** {len(episodes)}\n\n"
         f"📌 **Send episode number or range to start download.**\n"
-        f"• *Examples: 1 or 1-5 or 1002-1003*"
+        f"• *Examples: 1 or 1-5 or 1002-1003*\n"
+        f"• *Send `/cancel` anytime to stop*"
+    )
+
+    auto_btn = (
+        InlineKeyboardButton("❌ Stop Auto-Set", callback_data=f"unauto_{story_id}")
+        if is_tracked else
+        InlineKeyboardButton("🔔 Auto-Set New Episodes", callback_data=f"auto_{story_id}")
     )
 
     buttons = InlineKeyboardMarkup([
@@ -470,9 +621,7 @@ async def handle_story_click(client, callback_query):
             InlineKeyboardButton("All Episodes", callback_data=f"all_{story_id}"),
             InlineKeyboardButton("Select Episodes", callback_data=f"page_1_{story_id}")
         ],
-        [
-            InlineKeyboardButton("🔔 Auto-Set New Episodes", callback_data=f"auto_{story_id}")
-        ]
+        [auto_btn]
     ])
 
     if cover_image:
@@ -499,8 +648,12 @@ async def handle_auto_button(client, callback_query):
     }
     save_tracker(tracker)
     await callback_query.answer("✅ Auto-Set Activated!", show_alert=True)
+
+    stop_btn = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Stop Auto-Set", callback_data=f"unauto_{story_id}")]])
     await callback_query.message.reply_text(
-        f"🔔 **{story.get('title')}** ko Auto-Download par set kar diya gaya hai (Current: {len(episodes)} Eps).\nJab bhi naya episode aayega, bot uski photo aur title ke sath bhej dega!"
+        f"🔔 **{story.get('title')}** ko Auto-Download par set kar diya gaya hai (Current: {len(episodes)} Eps).\n"
+        f"Jab bhi naya episode aayega, bot khud bhej dega!",
+        reply_markup=stop_btn
     )
 
 @app.on_callback_query(filters.regex(r"^all_"))
@@ -509,13 +662,19 @@ async def handle_all_episodes(client, callback_query):
         await callback_query.answer("All Episodes Download shuru...")
     except Exception:
         pass
+    chat_id = callback_query.message.chat.id
+    CANCEL_FLAGS[chat_id] = False
+
     story_id = callback_query.data.split("_")[1]
     story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     if not story:
         return
     episodes = story.get("episodes", [])
     for idx, ep in enumerate(episodes, 1):
-        await process_and_send_episode(callback_query.message.chat.id, ep, idx, story.get("title"), story.get("coverImage"))
+        if CANCEL_FLAGS.get(chat_id):
+            await app.send_message(chat_id, "🛑 **All Episodes Download Cancelled!**")
+            break
+        await process_and_send_episode(chat_id, ep, idx, story.get("title"), story.get("coverImage"))
 
 @app.on_callback_query(filters.regex(r"^page_"))
 async def handle_select_episodes_grid(client, callback_query):
@@ -537,8 +696,7 @@ async def handle_select_episodes_grid(client, callback_query):
 
     buttons = []
     for idx, ep in enumerate(current_eps, start=start + 1):
-        ep_id, btn_label, full_title, _ = extract_episode_meta(ep, idx)
-        # Button par exact Episode Number + Title dikhana (jaise: "1002-1003. DR DHRUV")
+        _, _, full_title, _ = extract_episode_meta(ep, idx)
         buttons.append([InlineKeyboardButton(f"▶️ {full_title}", callback_data=f"one_{idx}_{story_id}")])
 
     nav = []
@@ -550,7 +708,7 @@ async def handle_select_episodes_grid(client, callback_query):
         buttons.append(nav)
 
     await callback_query.message.reply_text(
-        f"🎬 **{story.get('title')} - Episodes List (Page {page}/{total_pages}):**\n👇 Jis episode ko download karna hai us par click karein:",
+        f"🎬 **{story.get('title')} - Episodes List (Page {page}/{total_pages}):**",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -570,5 +728,6 @@ async def handle_single_episode(client, callback_query):
         await process_and_send_episode(callback_query.message.chat.id, ep_obj, idx, story.get("title"), story.get("coverImage"))
 
 login_to_site()
-print(">>> Naman Story Bot v3 (Episode Photos + Exact Titles) is READY!")
+print(">>> Naman Story Bot v4 (Cancel/Stop + Deep Image Finder) is READY!")
 app.run()
+
