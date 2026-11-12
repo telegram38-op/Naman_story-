@@ -4,6 +4,7 @@ import json
 import asyncio
 import subprocess
 import requests
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -34,10 +35,32 @@ EPISODE_STORE = {}
 USER_STATE = {}
 CANCEL_FLAGS = {}
 TRACKER_FILE = "autoset_data.json"
+CDN_CACHE_FILE = "cdn_base.txt"
 TRACKER_RUNNING = False
 
 def log(msg):
     print(msg, flush=True)
+
+def save_cdn_base(full_url):
+    try:
+        p = urlparse(full_url)
+        if p.scheme and p.netloc and "namanstorybook.in" not in p.netloc:
+            base = f"{p.scheme}://{p.netloc}"
+            with open(CDN_CACHE_FILE, "w") as f:
+                f.write(base)
+            return base
+    except Exception:
+        pass
+    return None
+
+def load_cdn_base():
+    if os.path.exists(CDN_CACHE_FILE):
+        try:
+            with open(CDN_CACHE_FILE, "r") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return None
 
 def load_tracker():
     if os.path.exists(TRACKER_FILE):
@@ -61,52 +84,21 @@ async def safe_edit(message, text):
     except Exception:
         pass
 
-def normalize_url(u):
-    if not u or not isinstance(u, str):
+def resolve_media_url(val, fallback_cdn=None):
+    """Relative path, R2 key, ya full URL ko valid download link me badalna"""
+    if not val or not isinstance(val, str):
         return None
-    u = u.strip()
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    if u.startswith("/"):
-        return f"{BASE_URL}{u}"
-    return None
-
-def find_image_in_dict(d, ignore_url=None):
-    if not isinstance(d, dict):
-        return None
-
-    priority_keys = [
-        "thumbnail", "thumbnailUrl", "thumb", "thumbUrl",
-        "episodeImage", "episode_image", "epImage", "episodeThumbnail",
-        "image", "imageUrl", "img", "imgUrl",
-        "coverImage", "cover_image", "cover", "coverUrl",
-        "banner", "bannerUrl", "poster", "posterUrl", "artwork", "photo"
-    ]
-    for k in priority_keys:
-        val = d.get(k)
-        if isinstance(val, str) and val.strip():
-            full = normalize_url(val)
-            if full and full != ignore_url:
-                return full
-        elif isinstance(val, dict):
-            nested = val.get("url") or val.get("src") or val.get("path")
-            full = normalize_url(nested)
-            if full and full != ignore_url:
-                return full
-
-    for k, val in d.items():
-        if k in ["audioUrl", "audio_url", "url", "id", "seriesId", "storyId"]:
-            continue
-        if isinstance(val, str):
-            low = val.lower()
-            if any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", "r2.dev", "cloudfront", "images", "uploads"]):
-                full = normalize_url(val)
-                if full and full != ignore_url:
-                    return full
-    return None
+    val = val.strip()
+    if val.startswith("http://") or val.startswith("https://"):
+        save_cdn_base(val)
+        return val
+    cdn = fallback_cdn or load_cdn_base() or BASE_URL
+    if val.startswith("/"):
+        # Pehle CDN ya BASE_URL se jodein
+        return f"{BASE_URL}{val}"
+    return f"{cdn.rstrip('/')}/{val.lstrip('/')}"
 
 def login_to_site():
-    """Exact working login without corrupting session cookies"""
     session.cookies.clear()
     session.headers.pop("Authorization", None)
     login_urls = [f"{BASE_URL}/api/auth/login", f"{BASE_URL}/api/login"]
@@ -116,7 +108,6 @@ def login_to_site():
             res = session.post(url, json=payload, timeout=12)
             log(f"[LOGIN] {url} -> Status: {res.status_code}")
             if res.status_code in [200, 201]:
-                # Agar server ne Set-Cookie nahi bheja aur JSON me token diya hai tabhi header lagayein
                 if not session.cookies.get("access_token"):
                     try:
                         data = res.json()
@@ -136,7 +127,14 @@ def fetch_all_stories():
         res = session.get(f"{BASE_URL}/api/stories", timeout=12)
         if res.status_code == 200:
             data = res.json()
-            return data if isinstance(data, list) else data.get("stories", [])
+            stories = data if isinstance(data, list) else data.get("stories", [])
+            # Kisi bhi story ke coverImage ya free episode se CDN domain auto-detect karna
+            for s in stories:
+                if isinstance(s, dict):
+                    cov = s.get("coverImage")
+                    if isinstance(cov, str) and cov.startswith("http"):
+                        save_cdn_base(cov)
+            return stories
     except Exception:
         pass
     return []
@@ -153,10 +151,10 @@ def get_full_story_details(identifier):
     s_id = story_obj.get("id") if story_obj and story_obj.get("id") else identifier
 
     endpoints = [
-        f"{BASE_URL}/api/series/{s_id}",
-        f"{BASE_URL}/api/series/{slug}",
         f"{BASE_URL}/api/stories/{s_id}",
-        f"{BASE_URL}/api/stories/{slug}"
+        f"{BASE_URL}/api/stories/{slug}",
+        f"{BASE_URL}/api/series/{s_id}",
+        f"{BASE_URL}/api/series/{slug}"
     ]
     for ep_url in endpoints:
         try:
@@ -166,7 +164,6 @@ def get_full_story_details(identifier):
                 if isinstance(detail, dict):
                     inner = detail.get("series") or detail.get("story") or detail.get("data") or detail
                     if isinstance(inner, dict) and inner.get("episodes"):
-                        # Agar fetch_all_stories wale ep object me zyada keys hain toh merge karein
                         return inner
         except Exception:
             pass
@@ -174,109 +171,155 @@ def get_full_story_details(identifier):
     return story_obj
 
 def extract_episode_meta(ep, idx, fallback_cover=None):
-    fallback_cover = normalize_url(fallback_cover)
+    """Exact EpKeys: ['id', 'storyId', 'title', 'description', 'thumbnail', 'episodeNumber', 'episodeEnd', 'episodeLabel', 'audioUrl']"""
     if not isinstance(ep, dict):
         return str(ep), f"Ep {idx}", f"Episode {idx}", fallback_cover
 
-    ep_id = str(ep.get("id") or ep.get("_id") or "")
-    raw_title = ep.get("title") or ep.get("name") or ""
-    raw_ep_num = (
-        ep.get("episodeNumber")
-        or ep.get("episode_number")
-        or ep.get("number")
-        or ep.get("epNumber")
-        or ""
-    )
+    ep_id = str(ep.get("id") or "")
+    raw_title = (ep.get("title") or "").strip()
+    ep_num = ep.get("episodeNumber")
+    ep_end = ep.get("episodeEnd")
+    ep_label = (ep.get("episodeLabel") or "").strip()
 
-    if not raw_ep_num and raw_title:
-        m = re.match(r'^([E0-9]+(?:\s*-\s*[0-9]+)?)', raw_title.strip(), re.I)
-        if m:
-            raw_ep_num = m.group(1)
-
-    if raw_ep_num:
-        clean_num = str(raw_ep_num).lstrip("Ee")
-        btn_label = f"E{clean_num}"
-    elif raw_title:
-        btn_label = raw_title[:18]
+    # Exact Episode Number Range (jaise 1002-1003)
+    if ep_label:
+        num_str = ep_label
+    elif ep_num and ep_end and str(ep_num) != str(ep_end):
+        num_str = f"{ep_num}-{ep_end}"
+    elif ep_num:
+        num_str = str(ep_num)
     else:
-        btn_label = f"Ep {idx}"
+        num_str = str(idx)
+
+    clean_num = num_str.lstrip("Ee")
+    btn_label = f"E{clean_num}"
 
     if raw_title:
-        full_title = raw_title
-        if raw_ep_num and str(raw_ep_num) not in raw_title:
-            full_title = f"{raw_ep_num}. {raw_title}"
-    elif raw_ep_num:
-        full_title = f"Episode {raw_ep_num}"
+        # Agar title me pehle se number nahi hai toh jodein
+        if clean_num not in raw_title:
+            full_title = f"{clean_num}. {raw_title}"
+        else:
+            full_title = raw_title
     else:
-        full_title = f"Episode {idx}"
+        full_title = f"Episode {clean_num}"
 
-    ep_image = find_image_in_dict(ep, ignore_url=fallback_cover)
-    if not ep_image:
-        ep_image = find_image_in_dict(ep) or fallback_cover
+    # Episode ki apni thumbnail nikalna
+    raw_thumb = ep.get("thumbnail") or ep.get("coverImage") or ep.get("image")
+    ep_image = resolve_media_url(raw_thumb) if raw_thumb else resolve_media_url(fallback_cover)
 
     return ep_id, btn_label, full_title, ep_image
 
-def get_audio_url_and_meta(ep_id, ep_obj=None, story_cover=None):
-    """Exact working /api/episodes/{id}/audio-url with debug info"""
+def get_audio_candidates(ep_id, ep_obj=None, story_cover=None):
+    """Purchase bypass: Direct ep_obj['audioUrl'] + CDN/Base URL combinations + API fallback"""
+    candidates = []
     debug_notes = []
 
-    # 1. Check agar ep_obj me pehle se direct audio link hai
-    if isinstance(ep_obj, dict):
-        for k in ["audioUrl", "audio_url", "audio", "fileUrl", "streamUrl", "mp3Url"]:
-            val = ep_obj.get(k)
-            if isinstance(val, str) and val.strip().startswith("http"):
-                return val.strip(), find_image_in_dict(ep_obj, ignore_url=story_cover), "from_ep_obj"
+    raw_audio_field = ep_obj.get("audioUrl") if isinstance(ep_obj, dict) else None
+    raw_thumb_field = ep_obj.get("thumbnail") if isinstance(ep_obj, dict) else None
 
-    # 2. Main audio-url API call
-    api_url = f"{BASE_URL}/api/episodes/{ep_id}/audio-url"
-    try:
-        res = session.get(api_url, timeout=15)
-        log(f"[AUDIO API 1st] {res.status_code} -> {res.text[:200]}")
-        debug_notes.append(f"Try1({res.status_code}): {res.text[:80]}")
+    log(f"[EPISODE FIELDS] id={ep_id} | audioUrl={raw_audio_field} | thumbnail={raw_thumb_field}")
+    debug_notes.append(f"rawAudio={raw_audio_field}")
+    debug_notes.append(f"rawThumb={raw_thumb_field}")
 
-        if res.status_code != 200:
-            log(">>> Re-logging in to site...")
-            login_to_site()
-            res = session.get(api_url, timeout=15)
-            log(f"[AUDIO API 2nd] {res.status_code} -> {res.text[:200]}")
-            debug_notes.append(f"Try2({res.status_code}): {res.text[:80]}")
+    # 1. Agar ep_obj['audioUrl'] me value hai (Direct Bypass!)
+    if isinstance(raw_audio_field, str) and raw_audio_field.strip():
+        val = raw_audio_field.strip()
+        if val.startswith("http://") or val.startswith("https://"):
+            candidates.append(val)
+        else:
+            # CDN domain (from coverImage / thumbnail / cached R2) aur main site dono try karein
+            cdn = load_cdn_base()
+            if story_cover and story_cover.startswith("http"):
+                p = urlparse(story_cover)
+                cdn_from_cover = f"{p.scheme}://{p.netloc}"
+                candidates.append(f"{cdn_from_cover.rstrip('/')}/{val.lstrip('/')}")
+            if cdn:
+                candidates.append(f"{cdn.rstrip('/')}/{val.lstrip('/')}")
+            candidates.append(f"{BASE_URL}/{val.lstrip('/')}")
+            candidates.append(f"{BASE_URL}/api/files/{val.lstrip('/')}")
+            candidates.append(f"{BASE_URL}/uploads/{val.lstrip('/')}")
 
-        if res.status_code == 200:
+    # 2. Try API endpoints (agar free preview hai ya purchased hai)
+    api_urls = [
+        f"{BASE_URL}/api/episodes/{ep_id}/audio-url",
+        f"{BASE_URL}/api/episodes/{ep_id}/stream",
+        f"{BASE_URL}/api/episodes/{ep_id}/play",
+        f"{BASE_URL}/api/episodes/{ep_id}"
+    ]
+    for api_url in api_urls:
+        try:
+            res = session.get(api_url, timeout=10)
+            if res.status_code == 401:
+                login_to_site()
+                res = session.get(api_url, timeout=10)
+
+            if res.status_code == 200:
+                try:
+                    d = res.json()
+                    if isinstance(d, dict):
+                        inner = d.get("data") or d.get("episode") or d
+                        u = (
+                            d.get("audioUrl") or d.get("url") or d.get("signedUrl")
+                            or (inner.get("audioUrl") if isinstance(inner, dict) else None)
+                        )
+                        if isinstance(u, str) and u.strip():
+                            if u.startswith("http"):
+                                save_cdn_base(u)
+                                candidates.insert(0, u.strip())
+                            else:
+                                candidates.append(resolve_media_url(u.strip()))
+                except Exception:
+                    txt = res.text.strip().strip('"')
+                    if txt.startswith("http"):
+                        save_cdn_base(txt)
+                        candidates.insert(0, txt)
+            else:
+                debug_notes.append(f"{api_url.split('/')[-1]}:{res.status_code}")
+        except Exception:
+            pass
+
+    # Remove duplicates while preserving order
+    unique_candidates = []
+    for c in candidates:
+        if c and c not in unique_candidates:
+            unique_candidates.append(c)
+
+    return unique_candidates, " | ".join(debug_notes)
+
+def try_download_candidates(candidates, out_path):
+    """Sare candidate URLs ko test karke jahan se audio stream mile use download karna"""
+    for url in candidates:
+        for client_getter in [requests.get, session.get]:
             try:
-                d = res.json()
-                if isinstance(d, dict):
-                    inner = d.get("data") or d.get("episode") or d
-                    audio_u = (
-                        d.get("audioUrl") or d.get("url") or d.get("audio_url") or d.get("signedUrl") or d.get("link")
-                        or (inner.get("audioUrl") if isinstance(inner, dict) else None)
-                        or (inner.get("url") if isinstance(inner, dict) else None)
-                    )
-                    extra_img = find_image_in_dict(inner if isinstance(inner, dict) else d, ignore_url=story_cover)
-                    if audio_u:
-                        return normalize_url(audio_u), extra_img, "ok"
-                    else:
-                        debug_notes.append(f"Keys: {list(d.keys())}")
-                elif isinstance(d, str) and d.startswith("http"):
-                    return d.strip(), None, "ok"
-            except Exception:
-                txt = res.text.strip().strip('"')
-                if txt.startswith("http"):
-                    return txt, None, "ok"
-    except Exception as e:
-        debug_notes.append(f"Err: {e}")
+                headers = {"User-Agent": "Mozilla/5.0", "Referer": f"{BASE_URL}/"}
+                with client_getter(url, headers=headers, stream=True, timeout=60) as r:
+                    ct = r.headers.get("Content-Type", "").lower()
+                    if r.status_code == 200 and ("audio" in ct or "octet-stream" in ct or "mp4" in ct or "mpeg" in ct or int(r.headers.get("Content-Length", "10000")) > 5000):
+                        with open(out_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=1024 * 512):
+                                if chunk:
+                                    f.write(chunk)
+                        if os.path.exists(out_path) and os.path.getsize(out_path) > 5000:
+                            save_cdn_base(url)
+                            return True, url
+            except Exception as e:
+                log(f"[DL TRY FAIL] {url} -> {e}")
+    return False, None
 
-    return None, None, " | ".join(debug_notes)
-
-def download_file(url, out_path):
-    # Cloudflare R2 signed URLs par session cookies nahi bhejni chahiye, isliye plain requests.get
-    headers = {"User-Agent": "Mozilla/5.0"}
-    with requests.get(url, headers=headers, stream=True, timeout=90) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    f.write(chunk)
-    return out_path
+def download_image_file(url, out_path):
+    for getter in [requests.get, session.get]:
+        try:
+            with getter(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=20) as r:
+                if r.status_code == 200:
+                    with open(out_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 128):
+                            if chunk:
+                                f.write(chunk)
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
+                        return True
+        except Exception:
+            pass
+    return False
 
 def convert_to_m4a_compressed(input_file, output_m4a):
     try:
@@ -290,32 +333,18 @@ def convert_to_m4a_compressed(input_file, output_m4a):
     except Exception:
         return input_file
 
-def get_audio_duration_seconds(file_path):
+def get_audio_duration_seconds(file_path, fallback_dur=0):
     try:
         audio = MP4(file_path)
         return int(audio.info.length)
     except Exception:
-        return 0
+        return int(fallback_dur or 0)
 
 async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cover=None):
     ep_id, btn_label, full_ep_title, ep_image_url = extract_episode_meta(ep_obj, idx, story_cover)
 
     status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...\n*(Rokne ke liye /cancel bhejein)*")
-    audio_url, extra_img, debug_info = get_audio_url_and_meta(ep_id, ep_obj, story_cover)
-
-    if extra_img:
-        ep_image_url = extra_img
-
-    if not audio_url:
-        ep_keys = list(ep_obj.keys()) if isinstance(ep_obj, dict) else "str"
-        await safe_edit(
-            status,
-            f"❌ **{full_ep_title}** ka audio link nahi mila.\n"
-            f"🆔 `ID: {ep_id}`\n"
-            f"📡 `API: {debug_info}`\n"
-            f"🔑 `EpKeys: {ep_keys}`"
-        )
-        return
+    candidates, debug_info = get_audio_candidates(ep_id, ep_obj, story_cover)
 
     safe_name = re.sub(r'[\\/*?:"<>|]', "", full_ep_title).strip().replace(" ", "_")
     raw_file = f"temp_{ep_id}.mp3"
@@ -324,30 +353,40 @@ async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cove
 
     try:
         await safe_edit(status, f"⬇️ Downloading **{full_ep_title}**...")
-        download_file(audio_url, raw_file)
+        ok, used_url = try_download_candidates(candidates, raw_file)
+
+        if not ok:
+            await safe_edit(
+                status,
+                f"❌ **{full_ep_title}** download nahi ho saka.\n"
+                f"🔍 `Info: {debug_info}`\n"
+                f"🔗 `Tried: {candidates}`"
+            )
+            return
 
         await safe_edit(status, f"⚡ M4A 64k compression...")
         final_file = convert_to_m4a_compressed(raw_file, m4a_file)
 
-        duration_sec = get_audio_duration_seconds(final_file)
+        api_dur = ep_obj.get("duration", 0) if isinstance(ep_obj, dict) else 0
+        duration_sec = get_audio_duration_seconds(final_file, api_dur)
         mins, secs = divmod(duration_sec, 60)
         duration_text = f"{mins:02d}:{secs:02d}"
         size_mb = os.path.getsize(final_file) / (1024 * 1024)
 
         if ep_image_url:
-            try:
-                download_file(ep_image_url, thumb_file)
-                await app.send_photo(
-                    chat_id=chat_id,
-                    photo=thumb_file,
-                    caption=(
-                        f"🎬 **{full_ep_title}**\n"
-                        f"📖 **Series:** {story_title}\n"
-                        f"🏷️ **Episode:** `{btn_label}`"
+            if download_image_file(ep_image_url, thumb_file):
+                try:
+                    await app.send_photo(
+                        chat_id=chat_id,
+                        photo=thumb_file,
+                        caption=(
+                            f"🎬 **{full_ep_title}**\n"
+                            f"📖 **Series:** {story_title}\n"
+                            f"🏷️ **Episode:** `{btn_label}`"
+                        )
                     )
-                )
-            except Exception as e:
-                log(f"Ep image error: {e}")
+                except Exception as e:
+                    log(f"Photo send err: {e}")
 
         await safe_edit(status, f"⬆️ Uploading **{full_ep_title}**...")
         await app.send_audio(
@@ -782,5 +821,5 @@ async def handle_single_episode(client, callback_query):
         )
 
 login_to_site()
-log(">>> Naman Story Bot v6 (Clean Cookie Login + Live Telegram Debug) is READY!")
+log(">>> Naman Story Bot v7 (Purchase Bypass + Exact EpLabel & Thumbnail) is READY!")
 app.run()
