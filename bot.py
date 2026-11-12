@@ -24,14 +24,15 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": f"{BASE_URL}/",
-    "Content-Type": "application/json"
+    "Origin": BASE_URL
 })
 
 app = Client("naman_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 STORY_STORE = {}
+EPISODE_STORE = {}  # Direct episode lookup by ep_id
 USER_STATE = {}
-CANCEL_FLAGS = {}  # Batch downloads rokne ke liye
+CANCEL_FLAGS = {}
 TRACKER_FILE = "autoset_data.json"
 TRACKER_RUNNING = False
 
@@ -58,7 +59,6 @@ async def safe_edit(message, text):
         pass
 
 def normalize_url(u):
-    """Relative image path ko full URL me badalna"""
     if not u or not isinstance(u, str):
         return None
     u = u.strip()
@@ -69,11 +69,9 @@ def normalize_url(u):
     return None
 
 def find_image_in_dict(d, ignore_url=None):
-    """Dictionary ke andar kisi bhi naam se chhupi image URL ko dhoondhna"""
     if not isinstance(d, dict):
         return None
 
-    # 1. Priority keys check
     priority_keys = [
         "thumbnail", "thumbnailUrl", "thumb", "thumbUrl",
         "episodeImage", "episode_image", "epImage",
@@ -93,7 +91,6 @@ def find_image_in_dict(d, ignore_url=None):
             if full and full != ignore_url:
                 return full
 
-    # 2. Deep scan: kisi bhi key me agar .png/.jpg/.webp/.jpeg link ho
     for k, val in d.items():
         if k in ["audioUrl", "audio_url", "url", "id", "seriesId", "storyId"]:
             continue
@@ -106,17 +103,48 @@ def find_image_in_dict(d, ignore_url=None):
     return None
 
 def login_to_site():
+    """Fresh session login with token extraction"""
+    session.cookies.clear()
     login_urls = [f"{BASE_URL}/api/auth/login", f"{BASE_URL}/api/login"]
     payload = {"email": EMAIL, "password": PASSWORD}
     for url in login_urls:
         try:
             res = session.post(url, json=payload, timeout=12)
+            print(f"[LOGIN] {url} -> {res.status_code}")
             if res.status_code in [200, 201]:
-                print(">>> Site login successful!")
+                try:
+                    data = res.json()
+                    if isinstance(data, dict):
+                        acc = data.get("accessToken") or data.get("access_token") or data.get("token")
+                        ref = data.get("refreshToken") or data.get("refresh_token")
+                        if acc:
+                            session.cookies.set("access_token", acc, domain="www.namanstorybook.in")
+                            session.headers["Authorization"] = f"Bearer {acc}"
+                        if ref:
+                            session.cookies.set("refresh_token", ref, domain="www.namanstorybook.in")
+                except Exception:
+                    pass
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            print("[LOGIN ERR]:", e)
     return False
+
+def refresh_or_relogin():
+    try:
+        r = session.post(f"{BASE_URL}/api/auth/refresh", timeout=10)
+        if r.status_code in [200, 201]:
+            try:
+                d = r.json()
+                acc = d.get("accessToken") or d.get("access_token")
+                if acc:
+                    session.cookies.set("access_token", acc, domain="www.namanstorybook.in")
+                    session.headers["Authorization"] = f"Bearer {acc}"
+            except Exception:
+                pass
+            return True
+    except Exception:
+        pass
+    return login_to_site()
 
 def fetch_all_stories():
     try:
@@ -132,14 +160,13 @@ def get_full_story_details(identifier):
     story_obj = None
     stories = fetch_all_stories()
     for s in stories:
-        if s.get("id") == identifier or s.get("slug") == identifier:
+        if str(s.get("id")) == str(identifier) or str(s.get("slug")) == str(identifier):
             story_obj = s
             break
 
     slug = story_obj.get("slug") if story_obj and story_obj.get("slug") else identifier
     s_id = story_obj.get("id") if story_obj and story_obj.get("id") else identifier
 
-    # Different endpoints check karna taaki episodes ke pure fields milen
     endpoints = [
         f"{BASE_URL}/api/series/{s_id}",
         f"{BASE_URL}/api/series/{slug}",
@@ -160,34 +187,12 @@ def get_full_story_details(identifier):
 
     return story_obj
 
-def fetch_single_episode_image(ep_id, story_cover=None):
-    """Agar list me episode photo na ho toh direct episode API se nikalna"""
-    urls = [
-        f"{BASE_URL}/api/episodes/{ep_id}",
-        f"{BASE_URL}/api/episode/{ep_id}"
-    ]
-    for u in urls:
-        try:
-            r = session.get(u, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                ep_data = data.get("episode") or data.get("data") or data
-                img = find_image_in_dict(ep_data, ignore_url=story_cover)
-                if img:
-                    return img
-        except Exception:
-            pass
-    return None
-
 def extract_episode_meta(ep, idx, fallback_cover=None):
     fallback_cover = normalize_url(fallback_cover)
     if not isinstance(ep, dict):
         return str(ep), f"Ep {idx}", f"Episode {idx}", fallback_cover
 
-    # Log me keys print karna taaki exact field dikhe
-    print(f"[EPISODE {idx} DATA]: {json.dumps(ep)[:300]}")
-
-    ep_id = ep.get("id", "")
+    ep_id = str(ep.get("id") or ep.get("_id") or "")
     raw_title = ep.get("title") or ep.get("name") or ""
     raw_ep_num = (
         ep.get("episodeNumber")
@@ -219,36 +224,66 @@ def extract_episode_meta(ep, idx, fallback_cover=None):
     else:
         full_title = f"Episode {idx}"
 
-    # 1. Episode dict ke andar image dhoondhna (story cover ko ignore karke)
     ep_image = find_image_in_dict(ep, ignore_url=fallback_cover)
-
-    # 2. Agar nahi mili, toh single episode endpoint ya audio-url response me check karna
-    if not ep_image and ep_id:
-        ep_image = fetch_single_episode_image(ep_id, story_cover=fallback_cover)
-
-    # 3. Last fallback
     if not ep_image:
         ep_image = find_image_in_dict(ep) or fallback_cover
 
     return ep_id, btn_label, full_title, ep_image
 
-def get_audio_url_and_meta(episode_id):
-    api_url = f"{BASE_URL}/api/episodes/{episode_id}/audio-url"
-    res = session.get(api_url, timeout=15)
-    if res.status_code == 401:
-        if login_to_site():
-            res = session.get(api_url, timeout=15)
+def get_audio_url_and_meta(ep_id, ep_obj=None, story_cover=None):
+    """Multi-fallback audio URL & episode image extractor"""
+    # 1. Check agar episode object me pehle se direct audio link hai
+    if isinstance(ep_obj, dict):
+        for k in ["audioUrl", "audio_url", "audio", "fileUrl", "streamUrl", "mp3Url", "url"]:
+            val = ep_obj.get(k)
+            if isinstance(val, str) and (".mp3" in val.lower() or ".m4a" in val.lower() or "r2." in val.lower() or "http" in val.lower()):
+                return normalize_url(val), find_image_in_dict(ep_obj, ignore_url=story_cover)
 
-    if res.status_code == 200:
-        try:
-            d = res.json()
-            if isinstance(d, dict):
-                audio_u = d.get("audioUrl") or d.get("url") or d.get("audio_url")
-                extra_img = find_image_in_dict(d)
-                return audio_u, extra_img
-            return res.text.strip('"'), None
-        except Exception:
-            return res.text.strip('"'), None
+    # 2. Try API endpoints for signed audio URL
+    api_urls = [
+        f"{BASE_URL}/api/episodes/{ep_id}/audio-url",
+        f"{BASE_URL}/api/episodes/{ep_id}",
+        f"{BASE_URL}/api/episode/{ep_id}/audio-url",
+        f"{BASE_URL}/api/episode/{ep_id}"
+    ]
+
+    for attempt in range(2):
+        for api_url in api_urls:
+            try:
+                res = session.get(api_url, timeout=15)
+                print(f"[AUDIO FETCH] {api_url} -> Status: {res.status_code}, Body: {res.text[:180]}")
+
+                if res.status_code in [401, 403]:
+                    break  # Break inner loop to trigger re-login
+
+                if res.status_code == 200:
+                    try:
+                        d = res.json()
+                        if isinstance(d, dict):
+                            inner = d.get("episode") or d.get("data") or d
+                            audio_u = (
+                                d.get("audioUrl") or d.get("url") or d.get("audio_url") or d.get("signedUrl")
+                                or (inner.get("audioUrl") if isinstance(inner, dict) else None)
+                                or (inner.get("audio_url") if isinstance(inner, dict) else None)
+                                or (inner.get("url") if isinstance(inner, dict) else None)
+                            )
+                            extra_img = find_image_in_dict(inner if isinstance(inner, dict) else d, ignore_url=story_cover)
+                            if audio_u:
+                                return normalize_url(audio_u), extra_img
+                        elif isinstance(d, str) and d.startswith("http"):
+                            return d.strip(), None
+                    except Exception:
+                        txt = res.text.strip().strip('"')
+                        if txt.startswith("http"):
+                            return txt, None
+            except Exception as e:
+                print(f"[AUDIO ERR] {api_url}: {e}")
+
+        # Agar pehle attempt me 401/403 ya empty aaya toh re-login karke 2nd attempt
+        if attempt == 0:
+            print(">>> Re-authenticating session for audio fetch...")
+            refresh_or_relogin()
+
     return None, None
 
 def download_file(url, out_path):
@@ -283,13 +318,13 @@ async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cove
     ep_id, btn_label, full_ep_title, ep_image_url = extract_episode_meta(ep_obj, idx, story_cover)
 
     status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...\n*(Rokne ke liye /cancel bhejein)*")
-    audio_url, extra_img = get_audio_url_and_meta(ep_id)
+    audio_url, extra_img = get_audio_url_and_meta(ep_id, ep_obj, story_cover)
 
-    if extra_img and (not ep_image_url or ep_image_url == normalize_url(story_cover)):
+    if extra_img:
         ep_image_url = extra_img
 
     if not audio_url:
-        await safe_edit(status, f"❌ **{full_ep_title}** ka audio link nahi mila.")
+        await safe_edit(status, f"❌ **{full_ep_title}** ka audio link nahi mila (ID: `{ep_id}`).")
         return
 
     safe_name = re.sub(r'[\\/*?:"<>|]', "", full_ep_title).strip().replace(" ", "_")
@@ -364,7 +399,7 @@ async def background_auto_tracker():
                 new_found = False
 
                 for idx, ep in enumerate(episodes, start=1):
-                    ep_id = ep.get("id") if isinstance(ep, dict) else str(ep)
+                    ep_id = str(ep.get("id") if isinstance(ep, dict) else ep)
                     if ep_id not in known_ids:
                         _, _, full_title, _ = extract_episode_meta(ep, idx, story.get("coverImage"))
                         await app.send_message(
@@ -450,9 +485,9 @@ async def autoset_cmd(client, message):
         await message.reply_text("❌ Story nahi mili. Sahi slug ya ID daalein.")
         return
 
-    s_id = story.get("id") or query
+    s_id = str(story.get("id") or query)
     episodes = story.get("episodes", [])
-    ep_ids = [ep.get("id") if isinstance(ep, dict) else str(ep) for ep in episodes]
+    ep_ids = [str(ep.get("id") if isinstance(ep, dict) else ep) for ep in episodes]
     
     tracker = load_tracker()
     tracker[s_id] = {
@@ -566,7 +601,7 @@ async def handle_search_or_range(client, message):
 
     buttons = []
     for s in matches[:10]:
-        s_id = s.get("id")
+        s_id = str(s.get("id"))
         STORY_STORE[s_id] = s
         label = s.get("title") + (f" ({s.get('category')})" if s.get('category') else "")
         buttons.append([InlineKeyboardButton(label, callback_data=f"sel_{s_id}")])
@@ -581,7 +616,7 @@ async def handle_story_click(client, callback_query):
     except Exception:
         pass
 
-    story_id = callback_query.data.split("_")[1]
+    story_id = callback_query.data.split("_", 1)[1]
     story = get_full_story_details(story_id) or STORY_STORE.get(story_id)
     if not story:
         return
@@ -591,6 +626,16 @@ async def handle_story_click(client, callback_query):
     category = story.get("category", "Hindi")
     cover_image = story.get("coverImage")
     episodes = story.get("episodes", [])
+
+    # Cache all episodes by ep_id for instant button clicks
+    for idx, ep in enumerate(episodes, 1):
+        if isinstance(ep, dict) and ep.get("id"):
+            EPISODE_STORE[str(ep.get("id"))] = {
+                "ep": ep,
+                "idx": idx,
+                "story_title": title,
+                "cover": cover_image
+            }
 
     USER_STATE[callback_query.from_user.id] = {
         "title": title,
@@ -606,7 +651,7 @@ async def handle_story_click(client, callback_query):
         f"🗣️ **Language:** {category}\n"
         f"📊 **Total Available Episodes:** {len(episodes)}\n\n"
         f"📌 **Send episode number or range to start download.**\n"
-        f"• *Examples: 1 or 1-5 or 1002-1003*\n"
+        f"• *Examples: 1 or 1-5 or 1002*\n"
         f"• *Send `/cancel` anytime to stop*"
     )
 
@@ -631,14 +676,14 @@ async def handle_story_click(client, callback_query):
 
 @app.on_callback_query(filters.regex(r"^auto_"))
 async def handle_auto_button(client, callback_query):
-    story_id = callback_query.data.split("_")[1]
+    story_id = callback_query.data.split("_", 1)[1]
     story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     if not story:
         await callback_query.answer("Story load nahi hui!", show_alert=True)
         return
 
     episodes = story.get("episodes", [])
-    ep_ids = [ep.get("id") if isinstance(ep, dict) else str(ep) for ep in episodes]
+    ep_ids = [str(ep.get("id") if isinstance(ep, dict) else ep) for ep in episodes]
     tracker = load_tracker()
     tracker[story_id] = {
         "title": story.get("title"),
@@ -665,7 +710,7 @@ async def handle_all_episodes(client, callback_query):
     chat_id = callback_query.message.chat.id
     CANCEL_FLAGS[chat_id] = False
 
-    story_id = callback_query.data.split("_")[1]
+    story_id = callback_query.data.split("_", 1)[1]
     story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
     if not story:
         return
@@ -682,11 +727,16 @@ async def handle_select_episodes_grid(client, callback_query):
         await callback_query.answer()
     except Exception:
         pass
-    parts = callback_query.data.split("_")
+    # maxsplit=2 taaki story_id ke andar underscore hone par bhi break na ho
+    parts = callback_query.data.split("_", 2)
     page = int(parts[1])
     story_id = parts[2]
     story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
+    if not story:
+        return
     episodes = story.get("episodes", [])
+    title = story.get("title", "Story")
+    cover_image = story.get("coverImage")
 
     per_page = 10
     total_pages = (len(episodes) + per_page - 1) // per_page
@@ -696,8 +746,14 @@ async def handle_select_episodes_grid(client, callback_query):
 
     buttons = []
     for idx, ep in enumerate(current_eps, start=start + 1):
-        _, _, full_title, _ = extract_episode_meta(ep, idx)
-        buttons.append([InlineKeyboardButton(f"▶️ {full_title}", callback_data=f"one_{idx}_{story_id}")])
+        ep_id, _, full_title, _ = extract_episode_meta(ep, idx)
+        EPISODE_STORE[str(ep_id)] = {
+            "ep": ep,
+            "idx": idx,
+            "story_title": title,
+            "cover": cover_image
+        }
+        buttons.append([InlineKeyboardButton(f"▶️ {full_title}", callback_data=f"epdl_{ep_id}")])
 
     nav = []
     if page > 1:
@@ -708,26 +764,35 @@ async def handle_select_episodes_grid(client, callback_query):
         buttons.append(nav)
 
     await callback_query.message.reply_text(
-        f"🎬 **{story.get('title')} - Episodes List (Page {page}/{total_pages}):**",
+        f"🎬 **{title} - Episodes List (Page {page}/{total_pages}):**",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-@app.on_callback_query(filters.regex(r"^one_"))
+@app.on_callback_query(filters.regex(r"^epdl_"))
 async def handle_single_episode(client, callback_query):
     try:
-        await callback_query.answer()
+        await callback_query.answer("Downloading episode...")
     except Exception:
         pass
-    parts = callback_query.data.split("_")
-    idx = int(parts[1])
-    story_id = parts[2]
-    story = STORY_STORE.get(story_id) or get_full_story_details(story_id)
-    episodes = story.get("episodes", [])
-    if 1 <= idx <= len(episodes):
-        ep_obj = episodes[idx - 1]
-        await process_and_send_episode(callback_query.message.chat.id, ep_obj, idx, story.get("title"), story.get("coverImage"))
+    ep_id = callback_query.data.split("_", 1)[1]
+    cached = EPISODE_STORE.get(str(ep_id))
+    if cached:
+        await process_and_send_episode(
+            callback_query.message.chat.id,
+            cached["ep"],
+            cached["idx"],
+            cached["story_title"],
+            cached["cover"]
+        )
+    else:
+        await process_and_send_episode(
+            callback_query.message.chat.id,
+            {"id": ep_id, "title": f"Episode {ep_id}"},
+            1,
+            "Naman Story",
+            None
+        )
 
 login_to_site()
-print(">>> Naman Story Bot v4 (Cancel/Stop + Deep Image Finder) is READY!")
+print(">>> Naman Story Bot v5 (Fixed Audio Fetch & Callback) is READY!")
 app.run()
-
