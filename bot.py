@@ -24,17 +24,20 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": f"{BASE_URL}/",
-    "Origin": BASE_URL
+    "Accept": "application/json, text/plain, */*"
 })
 
 app = Client("naman_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 STORY_STORE = {}
-EPISODE_STORE = {}  # Direct episode lookup by ep_id
+EPISODE_STORE = {}
 USER_STATE = {}
 CANCEL_FLAGS = {}
 TRACKER_FILE = "autoset_data.json"
 TRACKER_RUNNING = False
+
+def log(msg):
+    print(msg, flush=True)
 
 def load_tracker():
     if os.path.exists(TRACKER_FILE):
@@ -74,7 +77,7 @@ def find_image_in_dict(d, ignore_url=None):
 
     priority_keys = [
         "thumbnail", "thumbnailUrl", "thumb", "thumbUrl",
-        "episodeImage", "episode_image", "epImage",
+        "episodeImage", "episode_image", "epImage", "episodeThumbnail",
         "image", "imageUrl", "img", "imgUrl",
         "coverImage", "cover_image", "cover", "coverUrl",
         "banner", "bannerUrl", "poster", "posterUrl", "artwork", "photo"
@@ -103,48 +106,30 @@ def find_image_in_dict(d, ignore_url=None):
     return None
 
 def login_to_site():
-    """Fresh session login with token extraction"""
+    """Exact working login without corrupting session cookies"""
     session.cookies.clear()
+    session.headers.pop("Authorization", None)
     login_urls = [f"{BASE_URL}/api/auth/login", f"{BASE_URL}/api/login"]
     payload = {"email": EMAIL, "password": PASSWORD}
     for url in login_urls:
         try:
             res = session.post(url, json=payload, timeout=12)
-            print(f"[LOGIN] {url} -> {res.status_code}")
+            log(f"[LOGIN] {url} -> Status: {res.status_code}")
             if res.status_code in [200, 201]:
-                try:
-                    data = res.json()
-                    if isinstance(data, dict):
-                        acc = data.get("accessToken") or data.get("access_token") or data.get("token")
-                        ref = data.get("refreshToken") or data.get("refresh_token")
-                        if acc:
-                            session.cookies.set("access_token", acc, domain="www.namanstorybook.in")
-                            session.headers["Authorization"] = f"Bearer {acc}"
-                        if ref:
-                            session.cookies.set("refresh_token", ref, domain="www.namanstorybook.in")
-                except Exception:
-                    pass
+                # Agar server ne Set-Cookie nahi bheja aur JSON me token diya hai tabhi header lagayein
+                if not session.cookies.get("access_token"):
+                    try:
+                        data = res.json()
+                        if isinstance(data, dict):
+                            acc = data.get("accessToken") or data.get("access_token") or data.get("token")
+                            if acc:
+                                session.headers["Authorization"] = f"Bearer {acc}"
+                    except Exception:
+                        pass
                 return True
         except Exception as e:
-            print("[LOGIN ERR]:", e)
+            log(f"[LOGIN ERR]: {e}")
     return False
-
-def refresh_or_relogin():
-    try:
-        r = session.post(f"{BASE_URL}/api/auth/refresh", timeout=10)
-        if r.status_code in [200, 201]:
-            try:
-                d = r.json()
-                acc = d.get("accessToken") or d.get("access_token")
-                if acc:
-                    session.cookies.set("access_token", acc, domain="www.namanstorybook.in")
-                    session.headers["Authorization"] = f"Bearer {acc}"
-            except Exception:
-                pass
-            return True
-    except Exception:
-        pass
-    return login_to_site()
 
 def fetch_all_stories():
     try:
@@ -181,6 +166,7 @@ def get_full_story_details(identifier):
                 if isinstance(detail, dict):
                     inner = detail.get("series") or detail.get("story") or detail.get("data") or detail
                     if isinstance(inner, dict) and inner.get("episodes"):
+                        # Agar fetch_all_stories wale ep object me zyada keys hain toh merge karein
                         return inner
         except Exception:
             pass
@@ -231,63 +217,60 @@ def extract_episode_meta(ep, idx, fallback_cover=None):
     return ep_id, btn_label, full_title, ep_image
 
 def get_audio_url_and_meta(ep_id, ep_obj=None, story_cover=None):
-    """Multi-fallback audio URL & episode image extractor"""
-    # 1. Check agar episode object me pehle se direct audio link hai
+    """Exact working /api/episodes/{id}/audio-url with debug info"""
+    debug_notes = []
+
+    # 1. Check agar ep_obj me pehle se direct audio link hai
     if isinstance(ep_obj, dict):
-        for k in ["audioUrl", "audio_url", "audio", "fileUrl", "streamUrl", "mp3Url", "url"]:
+        for k in ["audioUrl", "audio_url", "audio", "fileUrl", "streamUrl", "mp3Url"]:
             val = ep_obj.get(k)
-            if isinstance(val, str) and (".mp3" in val.lower() or ".m4a" in val.lower() or "r2." in val.lower() or "http" in val.lower()):
-                return normalize_url(val), find_image_in_dict(ep_obj, ignore_url=story_cover)
+            if isinstance(val, str) and val.strip().startswith("http"):
+                return val.strip(), find_image_in_dict(ep_obj, ignore_url=story_cover), "from_ep_obj"
 
-    # 2. Try API endpoints for signed audio URL
-    api_urls = [
-        f"{BASE_URL}/api/episodes/{ep_id}/audio-url",
-        f"{BASE_URL}/api/episodes/{ep_id}",
-        f"{BASE_URL}/api/episode/{ep_id}/audio-url",
-        f"{BASE_URL}/api/episode/{ep_id}"
-    ]
+    # 2. Main audio-url API call
+    api_url = f"{BASE_URL}/api/episodes/{ep_id}/audio-url"
+    try:
+        res = session.get(api_url, timeout=15)
+        log(f"[AUDIO API 1st] {res.status_code} -> {res.text[:200]}")
+        debug_notes.append(f"Try1({res.status_code}): {res.text[:80]}")
 
-    for attempt in range(2):
-        for api_url in api_urls:
+        if res.status_code != 200:
+            log(">>> Re-logging in to site...")
+            login_to_site()
+            res = session.get(api_url, timeout=15)
+            log(f"[AUDIO API 2nd] {res.status_code} -> {res.text[:200]}")
+            debug_notes.append(f"Try2({res.status_code}): {res.text[:80]}")
+
+        if res.status_code == 200:
             try:
-                res = session.get(api_url, timeout=15)
-                print(f"[AUDIO FETCH] {api_url} -> Status: {res.status_code}, Body: {res.text[:180]}")
+                d = res.json()
+                if isinstance(d, dict):
+                    inner = d.get("data") or d.get("episode") or d
+                    audio_u = (
+                        d.get("audioUrl") or d.get("url") or d.get("audio_url") or d.get("signedUrl") or d.get("link")
+                        or (inner.get("audioUrl") if isinstance(inner, dict) else None)
+                        or (inner.get("url") if isinstance(inner, dict) else None)
+                    )
+                    extra_img = find_image_in_dict(inner if isinstance(inner, dict) else d, ignore_url=story_cover)
+                    if audio_u:
+                        return normalize_url(audio_u), extra_img, "ok"
+                    else:
+                        debug_notes.append(f"Keys: {list(d.keys())}")
+                elif isinstance(d, str) and d.startswith("http"):
+                    return d.strip(), None, "ok"
+            except Exception:
+                txt = res.text.strip().strip('"')
+                if txt.startswith("http"):
+                    return txt, None, "ok"
+    except Exception as e:
+        debug_notes.append(f"Err: {e}")
 
-                if res.status_code in [401, 403]:
-                    break  # Break inner loop to trigger re-login
-
-                if res.status_code == 200:
-                    try:
-                        d = res.json()
-                        if isinstance(d, dict):
-                            inner = d.get("episode") or d.get("data") or d
-                            audio_u = (
-                                d.get("audioUrl") or d.get("url") or d.get("audio_url") or d.get("signedUrl")
-                                or (inner.get("audioUrl") if isinstance(inner, dict) else None)
-                                or (inner.get("audio_url") if isinstance(inner, dict) else None)
-                                or (inner.get("url") if isinstance(inner, dict) else None)
-                            )
-                            extra_img = find_image_in_dict(inner if isinstance(inner, dict) else d, ignore_url=story_cover)
-                            if audio_u:
-                                return normalize_url(audio_u), extra_img
-                        elif isinstance(d, str) and d.startswith("http"):
-                            return d.strip(), None
-                    except Exception:
-                        txt = res.text.strip().strip('"')
-                        if txt.startswith("http"):
-                            return txt, None
-            except Exception as e:
-                print(f"[AUDIO ERR] {api_url}: {e}")
-
-        # Agar pehle attempt me 401/403 ya empty aaya toh re-login karke 2nd attempt
-        if attempt == 0:
-            print(">>> Re-authenticating session for audio fetch...")
-            refresh_or_relogin()
-
-    return None, None
+    return None, None, " | ".join(debug_notes)
 
 def download_file(url, out_path):
-    with session.get(url, stream=True, timeout=90) as r:
+    # Cloudflare R2 signed URLs par session cookies nahi bhejni chahiye, isliye plain requests.get
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with requests.get(url, headers=headers, stream=True, timeout=90) as r:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 512):
@@ -318,13 +301,20 @@ async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cove
     ep_id, btn_label, full_ep_title, ep_image_url = extract_episode_meta(ep_obj, idx, story_cover)
 
     status = await app.send_message(chat_id, f"⏳ **{full_ep_title}** fetch ho raha hai...\n*(Rokne ke liye /cancel bhejein)*")
-    audio_url, extra_img = get_audio_url_and_meta(ep_id, ep_obj, story_cover)
+    audio_url, extra_img, debug_info = get_audio_url_and_meta(ep_id, ep_obj, story_cover)
 
     if extra_img:
         ep_image_url = extra_img
 
     if not audio_url:
-        await safe_edit(status, f"❌ **{full_ep_title}** ka audio link nahi mila (ID: `{ep_id}`).")
+        ep_keys = list(ep_obj.keys()) if isinstance(ep_obj, dict) else "str"
+        await safe_edit(
+            status,
+            f"❌ **{full_ep_title}** ka audio link nahi mila.\n"
+            f"🆔 `ID: {ep_id}`\n"
+            f"📡 `API: {debug_info}`\n"
+            f"🔑 `EpKeys: {ep_keys}`"
+        )
         return
 
     safe_name = re.sub(r'[\\/*?:"<>|]', "", full_ep_title).strip().replace(" ", "_")
@@ -357,7 +347,7 @@ async def process_and_send_episode(chat_id, ep_obj, idx, story_title, story_cove
                     )
                 )
             except Exception as e:
-                print("Ep image error:", e)
+                log(f"Ep image error: {e}")
 
         await safe_edit(status, f"⬆️ Uploading **{full_ep_title}**...")
         await app.send_audio(
@@ -415,7 +405,7 @@ async def background_auto_tracker():
                     data["last_count"] = len(episodes)
                     save_tracker(tracker)
         except Exception as e:
-            print("Tracker error:", e)
+            log(f"Tracker error: {e}")
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
@@ -627,7 +617,6 @@ async def handle_story_click(client, callback_query):
     cover_image = story.get("coverImage")
     episodes = story.get("episodes", [])
 
-    # Cache all episodes by ep_id for instant button clicks
     for idx, ep in enumerate(episodes, 1):
         if isinstance(ep, dict) and ep.get("id"):
             EPISODE_STORE[str(ep.get("id"))] = {
@@ -727,7 +716,6 @@ async def handle_select_episodes_grid(client, callback_query):
         await callback_query.answer()
     except Exception:
         pass
-    # maxsplit=2 taaki story_id ke andar underscore hone par bhi break na ho
     parts = callback_query.data.split("_", 2)
     page = int(parts[1])
     story_id = parts[2]
@@ -794,5 +782,5 @@ async def handle_single_episode(client, callback_query):
         )
 
 login_to_site()
-print(">>> Naman Story Bot v5 (Fixed Audio Fetch & Callback) is READY!")
+log(">>> Naman Story Bot v6 (Clean Cookie Login + Live Telegram Debug) is READY!")
 app.run()
